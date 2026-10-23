@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Design Harness</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form id="login-form" class="login-card">
+    <h1>Design Harness</h1>
+    <p>This demo is private. Enter the password.</p>
+    <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+    <button type="submit">Sign in</button>
+    <p id="login-error" class="login-error" hidden>That password is not right.</p>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <aside class="chat">
+    <header class="chat-header">
+      <span class="logo">◆</span>
+      <span class="chat-title">Design Harness</span>
+      <button id="new-project" class="ghost" title="Start a new project">New</button>
+    </header>
+    <div id="messages" class="messages"></div>
+    <div id="examples" class="examples">
+      <p>Describe what you need. For example:</p>
+      <button class="example">I have a streetwear clothing brand in Lagos and I want a website to sell online.</button>
+      <button class="example">A website for my family bakery in Abuja — we take orders for cakes and pastries.</button>
+      <button class="example">A landing page for a mobile app that helps students split rent with flatmates.</button>
+    </div>
+    <form id="composer" class="composer">
+      <textarea id="input" rows="3" placeholder="Describe what you want to design…"></textarea>
+      <div class="composer-row">
+        <span id="status" class="status"></span>
+        <button id="stop" type="button" class="ghost" hidden>Stop</button>
+        <button id="send" type="submit">Send</button>
+      </div>
+    </form>
+  </aside>
+
+  <main class="stage">
+    <div class="toolbar">
+      <span id="project-name" class="project-name">Untitled</span>
+      <div class="toolbar-group">
+        <button id="zoom-out" class="ghost" title="Zoom out">−</button>
+        <button id="zoom-level" class="ghost zoom-level" title="Fit to screen">100%</button>
+        <button id="zoom-in" class="ghost" title="Zoom in">+</button>
+      </div>
+      <div class="toolbar-group">
+        <label class="button ghost" title="Open a design file">
+          Open<input id="open-file" type="file" accept=".html,text/html" hidden>
+        </label>
+        <div class="menu">
+          <button id="export-button" title="Export">Export ▾</button>
+          <div id="export-menu" class="menu-list" hidden>
+            <button data-export="html">Design file (.html)</button>
+            <button data-export="png-desktop">Desktop image (.png)</button>
+            <button data-export="png-phone">Phone image (.png)</button>
+            <button data-export="css">Design system (.css)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="viewport" class="viewport">
+      <div id="world" class="world">
+        <section class="frame" data-frame="board" style="left:0;top:0;width:560px">
+          <div class="frame-label">Design system</div>
+          <div class="frame-body" style="height:900px"></div>
+        </section>
+        <section class="frame" data-frame="desktop" style="left:640px;top:0;width:1440px">
+          <div class="frame-label">Desktop · 1440</div>
+          <div class="frame-body" style="height:900px"></div>
+        </section>
+        <section class="frame" data-frame="phone" style="left:2160px;top:0;width:390px">
+          <div class="frame-label">Phone · 390</div>
+          <div class="frame-body" style="height:844px"></div>
+        </section>
+      </div>
+      <div id="empty" class="empty">Your design will appear here.</div>
+    </div>
+  </main>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

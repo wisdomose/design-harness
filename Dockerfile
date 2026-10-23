@@ -10,16 +10,21 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:trixie-slim
 # The design agent is the Claude Code command-line tool, signed in with
-# CLAUDE_CODE_OAUTH_TOKEN at run time.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl nodejs npm \
+# CLAUDE_CODE_OAUTH_TOKEN at run time. Chromium opens reference sites for it
+# (capture/capture.mjs).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl nodejs npm chromium fonts-liberation fonts-noto-color-emoji \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force \
-    && apt-get purge -y npm && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 app
+COPY capture/package.json capture/package-lock.json /opt/capture/
+RUN cd /opt/capture && npm ci --omit=dev && npm cache clean --force
+COPY capture/capture.mjs /opt/capture/
 COPY --from=build /app/target/release/design-harness /usr/local/bin/design-harness
 USER app
 ENV HOME=/home/app PORT=8080 WORK_DIR=/home/app/work SECURE_COOKIE=true \
+    CAPTURE_SCRIPT=/opt/capture/capture.mjs CHROMIUM_PATH=/usr/bin/chromium \
     DISABLE_AUTOUPDATER=1 RUST_LOG=design_harness=info
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s CMD curl -fs http://localhost:8080/health || exit 1

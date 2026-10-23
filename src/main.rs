@@ -8,6 +8,8 @@
 
 use std::{collections::HashSet, convert::Infallible, process::Stdio, sync::Arc, time::Duration};
 
+mod reference;
+
 use axum::{
     Json, Router,
     extract::State,
@@ -38,6 +40,7 @@ struct AppState {
     password: String,
     model: String,
     claude_bin: String,
+    capture_script: String,
     work_dir: String,
     secure_cookie: bool,
     sessions: Mutex<HashSet<String>>,
@@ -69,6 +72,8 @@ async fn main() {
         password,
         model: std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-5-5".into()),
         claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+        capture_script: std::env::var("CAPTURE_SCRIPT")
+            .unwrap_or_else(|_| "capture/capture.mjs".into()),
         work_dir,
         secure_cookie: std::env::var("SECURE_COOKIE")
             .map(|v| v == "true")
@@ -171,6 +176,16 @@ struct DesignBody {
     message: String,
     /// The current design file, when this is a change to an existing one.
     html: Option<String>,
+    /// The conversation so far, oldest first, so a follow-up like "you only
+    /// changed the colour" can be understood.
+    #[serde(default)]
+    history: Vec<Turn>,
+}
+
+#[derive(Deserialize)]
+struct Turn {
+    role: String,
+    text: String,
 }
 
 async fn design(
@@ -189,22 +204,11 @@ async fn design(
             .into_response();
     };
 
-    let prompt = match body.html.as_deref().filter(|h| !h.trim().is_empty()) {
-        None => format!(
-            "New project. The person wrote:\n\n{}\n\nCreate the design system, then the page, as one complete HTML file.",
-            body.message
-        ),
-        Some(html) => format!(
-            "Here is the current design file:\n\n```html\n{html}\n```\n\nThe person asks for this change:\n\n{}\n\nReturn the complete updated HTML file.",
-            body.message
-        ),
-    };
-
     let (tx, rx) = mpsc::channel::<Event>(256);
     let state2 = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        let result = tokio::time::timeout(state2.timeout, run_claude(&state2, &prompt, &tx)).await;
+        let result = tokio::time::timeout(state2.timeout, run_design(&state2, &body, &tx)).await;
         let end = match result {
             Ok(Ok(())) => Event::default().event("done").data("{}"),
             Ok(Err(message)) => {
@@ -225,15 +229,102 @@ async fn design(
         .into_response()
 }
 
+async fn status(tx: &mpsc::Sender<Event>, text: &str) {
+    tx.send(
+        Event::default()
+            .event("status")
+            .data(json!({ "text": text }).to_string()),
+    )
+    .await
+    .ok();
+}
+
+/// Gathers what the designer needs — the conversation, the current file and
+/// any reference sites — and runs it.
+async fn run_design(
+    state: &AppState,
+    body: &DesignBody,
+    tx: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    // Links in this message, or in the one before it when this one is a
+    // follow-up about the same reference ("you only changed the colour").
+    let mut links = reference::find_links(&body.message);
+    if links.is_empty()
+        && let Some(previous) = body.history.iter().rev().find(|t| t.role == "user")
+    {
+        links = reference::find_links(&previous.text);
+    }
+
+    let mut content: Vec<Value> = Vec::new();
+    let request_dir = std::path::Path::new(&state.work_dir).join(uuid::Uuid::new_v4().to_string());
+    for link in &links {
+        let host = link
+            .split("//")
+            .nth(1)
+            .and_then(|r| r.split('/').next())
+            .unwrap_or(link);
+        status(tx, &format!("Opening {host}…")).await;
+        let capture = reference::capture(&state.capture_script, link, &request_dir).await;
+        match &capture.error {
+            None => status(tx, &format!("Studying {host}…")).await,
+            Some(e) => {
+                tracing::info!("reference {} failed: {e}", capture.url);
+                status(tx, &format!("Could not open {host}")).await;
+            }
+        }
+        content.extend(capture.blocks);
+    }
+    tokio::fs::remove_dir_all(&request_dir).await.ok();
+
+    let mut prompt = String::new();
+    let earlier: Vec<String> = body
+        .history
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .map(|t| {
+            let who = if t.role == "user" { "Person" } else { "You" };
+            format!("{who}: {}", t.text)
+        })
+        .collect();
+    if !earlier.is_empty() {
+        prompt.push_str("The conversation so far:\n\n");
+        prompt.push_str(&earlier.join("\n"));
+        prompt.push_str("\n\n");
+    }
+    match body.html.as_deref().filter(|h| !h.trim().is_empty()) {
+        None => prompt.push_str(&format!(
+            "New project. The person wrote:\n\n{}\n\nWrite your note, then create the design system and the page as one complete HTML file.",
+            body.message
+        )),
+        Some(html) => prompt.push_str(&format!(
+            "Here is the current design file:\n\n```html\n{html}\n```\n\nThe person now writes:\n\n{}\n\nWrite your note, then the complete updated HTML file (or only the note, if no change to the design is wanted).",
+            body.message
+        )),
+    }
+    if !links.is_empty() {
+        prompt.push_str(
+            "\n\nThe reference site(s) above were opened for you; follow the reference rules.",
+        );
+    }
+    content.push(json!({ "type": "text", "text": prompt }));
+
+    status(tx, "Designing…").await;
+    run_claude(state, content, tx).await
+}
+
 /// Runs one `claude -p` turn with no tools and forwards its text as it streams.
 async fn run_claude(
     state: &AppState,
-    prompt: &str,
+    content: Vec<Value>,
     tx: &mpsc::Sender<Event>,
 ) -> Result<(), String> {
     let mut child = Command::new(&state.claude_bin)
         .args([
             "-p",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -257,11 +348,17 @@ async fn run_claude(
         .spawn()
         .map_err(|e| format!("could not start claude: {e}"))?;
 
-    // The prompt can hold a whole design file, so it goes in on stdin rather
-    // than the command line.
+    // The request can hold a whole design file and screenshots, so it goes in
+    // on stdin as one user message rather than on the command line.
+    let message = json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+    });
+    let mut line = message.to_string();
+    line.push('\n');
     let mut stdin = child.stdin.take().expect("stdin");
     stdin
-        .write_all(prompt.as_bytes())
+        .write_all(line.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     drop(stdin);

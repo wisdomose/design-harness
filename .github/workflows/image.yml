@@ -25,7 +25,8 @@ jobs:
           key: cargo-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: node --check web/app.js
+      - run: cargo test
+      - run: node --check web/app.js && node --check capture/capture.mjs
 
   image:
     needs: check

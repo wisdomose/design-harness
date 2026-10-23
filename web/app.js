@@ -49,6 +49,12 @@ function escapeHtml(s) {
   return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 }
 
+/** The designer's note to the person, which comes before the document. */
+function noteOf(text) {
+  const m = text.match(/^\s*<note>([\s\S]*?)(<\/note>|$)/i);
+  return m ? m[1].trim() : "";
+}
+
 /** The document from the first `<!doctype` or `<html`, cut after `</html>`. */
 function extractDocument(text) {
   const start = text.search(/<!doctype|<html/i);
@@ -308,6 +314,7 @@ function setBusy(busy, status = "") {
 async function send(text) {
   if (state.busy || !text.trim()) return;
   const isChange = !!state.html;
+  const history = state.messages.filter((m) => m.role !== "error");
   state.messages.push({ role: "user", text });
   addMessage("user", text);
   save();
@@ -323,6 +330,8 @@ async function send(text) {
   let failed = null;
 
   const progress = () => {
+    const note = noteOf(acc);
+    if (note) agentEl.textContent = note;
     const doc = extractDocument(acc);
     if (!doc) return;
     const themeDone = /<\/style>/i.test(doc) && !!parseTheme(doc);
@@ -334,7 +343,7 @@ async function send(text) {
       boardShown = true;
       showDesign(doc, { board: true, page: false });
       fit();
-      agentEl.textContent = "Design system ready. Designing the page…";
+      if (!note) agentEl.textContent = "Design system ready. Designing the page…";
     }
     if (inBody && Date.now() - lastRender > 900) {
       lastRender = Date.now();
@@ -350,7 +359,7 @@ async function send(text) {
     const res = await fetch("/api/design", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: text, html: state.html || null }),
+      body: JSON.stringify({ message: text, html: state.html || null, history }),
       signal: abort.signal,
     });
     if (res.status === 401) {
@@ -379,6 +388,10 @@ async function send(text) {
         if (event === "delta") {
           acc += JSON.parse(data).text;
           progress();
+        } else if (event === "status") {
+          const status = JSON.parse(data).text;
+          setBusy(true, status);
+          if (!acc) agentEl.textContent = status;
         } else if (event === "error") {
           failed = JSON.parse(data).message;
         }
@@ -390,7 +403,9 @@ async function send(text) {
 
   state.abort = null;
   const doc = extractDocument(acc);
-  if (!failed && !/<\/html>/i.test(doc)) failed = "The designer did not return a complete design. Try again.";
+  const note = noteOf(acc);
+  const replyOnly = !failed && !doc && !!note; // answered without changing the design
+  if (!failed && !replyOnly && !/<\/html>/i.test(doc)) failed = "The designer did not return a complete design. Try again.";
 
   if (failed) {
     agentEl.className = "message error";
@@ -398,13 +413,18 @@ async function send(text) {
     state.messages.push({ role: "error", text: failed });
     // Put the last good design back if a half-made one is showing.
     if (state.html) showDesign(state.html);
+  } else if (replyOnly) {
+    agentEl.textContent = note;
+    state.messages.push({ role: "agent", text: note });
   } else {
     state.html = doc;
     showDesign(doc);
     const theme = parseTheme(doc) || [];
     const font = (n) => (theme.find((t) => t.name === `font-${n}`)?.value || "").split(",")[0].replace(/["']/g, "");
     const primary = theme.find((t) => t.name === "color-primary")?.value;
-    const summary = isChange
+    const summary = note
+      ? note
+      : isChange
       ? "Done. Ask for another change, or export from the top right."
       : `Done. ${font("heading")} with ${font("body")}${primary ? `, primary colour ${primary}` : ""}. Ask for any change, or export from the top right.`;
     agentEl.textContent = summary;

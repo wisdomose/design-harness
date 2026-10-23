@@ -8,6 +8,7 @@
 
 use std::{collections::HashSet, convert::Infallible, process::Stdio, sync::Arc, time::Duration};
 
+mod directions;
 mod reference;
 
 use axum::{
@@ -31,6 +32,14 @@ use tokio::{
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 const SESSION_COOKIE: &str = "dh_session";
+/// The models the picker offers, as (id, label). Fable 5.1 is left out: on
+/// the subscription it needs extra usage credits.
+const MODELS: &[(&str, &str)] = &[
+    ("claude-opus-5-5", "Opus 5.5"),
+    ("claude-sonnet-5-5", "Sonnet 5.5"),
+    ("claude-haiku-5-5", "Haiku 5.5"),
+];
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const SYSTEM_PROMPT: &str = include_str!("prompt.md");
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -38,7 +47,8 @@ const APP_CSS: &str = include_str!("../web/app.css");
 
 struct AppState {
     password: String,
-    model: String,
+    default_model: String,
+    default_effort: String,
     claude_bin: String,
     capture_script: String,
     work_dir: String,
@@ -70,7 +80,8 @@ async fn main() {
 
     let state = Arc::new(AppState {
         password,
-        model: std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-5-5".into()),
+        default_model: std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-opus-5-5".into()),
+        default_effort: std::env::var("CLAUDE_EFFORT").unwrap_or_else(|_| "medium".into()),
         claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
         capture_script: std::env::var("CAPTURE_SCRIPT")
             .unwrap_or_else(|_| "capture/capture.mjs".into()),
@@ -84,7 +95,7 @@ async fn main() {
             std::env::var("DESIGN_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(600),
+                .unwrap_or(900),
         ),
     });
 
@@ -103,6 +114,7 @@ async fn main() {
         )
         .route("/health", get(|| async { "ok" }))
         .route("/api/me", get(me))
+        .route("/api/options", get(options))
         .route("/api/login", post(login))
         .route("/api/design", post(design))
         .with_state(state);
@@ -170,6 +182,18 @@ async fn login(
     (jar.add(cookie), StatusCode::NO_CONTENT).into_response()
 }
 
+/// The choices the model and effort pickers offer, and which are selected
+/// when the person hasn't chosen.
+async fn options(State(state): State<Shared>) -> Json<Value> {
+    Json(json!({
+        "models": MODELS.iter().map(|(id, label)| json!({ "id": id, "label": label })).collect::<Vec<_>>(),
+        "efforts": EFFORTS,
+        "defaultModel": state.default_model,
+        "defaultEffort": state.default_effort,
+        "directions": directions::LIBRARY.iter().map(|d| json!({ "id": d.id, "name": d.name })).collect::<Vec<_>>(),
+    }))
+}
+
 #[derive(Deserialize)]
 struct DesignBody {
     /// What the person typed.
@@ -180,6 +204,12 @@ struct DesignBody {
     /// changed the colour" can be understood.
     #[serde(default)]
     history: Vec<Turn>,
+    /// Model and effort chosen in the UI; the server defaults when absent.
+    model: Option<String>,
+    effort: Option<String>,
+    /// Art directions used in the person's recent designs, to steer away from.
+    #[serde(default, rename = "recentDirections")]
+    recent_directions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +226,17 @@ async fn design(
     if !signed_in(&state, &jar).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let model = body
+        .model
+        .clone()
+        .unwrap_or_else(|| state.default_model.clone());
+    let effort = body
+        .effort
+        .clone()
+        .unwrap_or_else(|| state.default_effort.clone());
+    if !MODELS.iter().any(|(id, _)| *id == model) || !EFFORTS.contains(&effort.as_str()) {
+        return (StatusCode::BAD_REQUEST, "Unknown model or effort.").into_response();
+    }
     let Ok(permit) = state.busy.clone().try_acquire_owned() else {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -208,7 +249,11 @@ async fn design(
     let state2 = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        let result = tokio::time::timeout(state2.timeout, run_design(&state2, &body, &tx)).await;
+        let result = tokio::time::timeout(
+            state2.timeout,
+            run_design(&state2, &body, &model, &effort, &tx),
+        )
+        .await;
         let end = match result {
             Ok(Ok(())) => Event::default().event("done").data("{}"),
             Ok(Err(message)) => {
@@ -244,8 +289,19 @@ async fn status(tx: &mpsc::Sender<Event>, text: &str) {
 async fn run_design(
     state: &AppState,
     body: &DesignBody,
+    model: &str,
+    effort: &str,
     tx: &mpsc::Sender<Event>,
 ) -> Result<(), String> {
+    let is_new = body.html.as_deref().is_none_or(|h| h.trim().is_empty());
+    let pick = directions::pick(&body.recent_directions);
+    let starting_points = pick
+        .starting_points
+        .iter()
+        .map(|(id, name)| format!("{name} ({id})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     // Links in this message, or in the one before it when this one is a
     // follow-up about the same reference ("you only changed the colour").
     let mut links = reference::find_links(&body.message);
@@ -255,7 +311,10 @@ async fn run_design(
         links = reference::find_links(&previous.text);
     }
 
-    let mut content: Vec<Value> = Vec::new();
+    let mut content: Vec<Value> = vec![json!({
+        "type": "text",
+        "text": format!("ART DIRECTION LIBRARY (in random order)\n\n{}", pick.library),
+    })];
     let request_dir = std::path::Path::new(&state.work_dir).join(uuid::Uuid::new_v4().to_string());
     for link in &links {
         let host = link
@@ -307,17 +366,36 @@ async fn run_design(
         prompt.push_str(
             "\n\nThe reference site(s) above were opened for you; follow the reference rules.",
         );
+    } else if is_new {
+        prompt.push_str(&format!(
+            "\n\nStarting points for this project, chosen at random from the library: {starting_points}. Build from these unless the person named a style themselves."
+        ));
+    } else {
+        prompt.push_str(&format!(
+            "\n\nIf — and only if — the person asks for a new concept or a different direction, build it from these, chosen at random: {starting_points}."
+        ));
     }
     content.push(json!({ "type": "text", "text": prompt }));
 
-    status(tx, "Designing…").await;
-    run_claude(state, content, tx).await
+    if is_new && links.is_empty() {
+        let names: Vec<&str> = pick
+            .starting_points
+            .iter()
+            .map(|(_, n)| n.as_str())
+            .collect();
+        status(tx, &format!("Exploring {}…", names.join(" · "))).await;
+    } else {
+        status(tx, "Designing…").await;
+    }
+    run_claude(state, content, model, effort, tx).await
 }
 
 /// Runs one `claude -p` turn with no tools and forwards its text as it streams.
 async fn run_claude(
     state: &AppState,
     content: Vec<Value>,
+    model: &str,
+    effort: &str,
     tx: &mpsc::Sender<Event>,
 ) -> Result<(), String> {
     let mut child = Command::new(&state.claude_bin)
@@ -336,7 +414,9 @@ async fn run_claude(
             "--strict-mcp-config",
             "--no-session-persistence",
             "--model",
-            &state.model,
+            model,
+            "--effort",
+            effort,
             "--system-prompt",
             SYSTEM_PROMPT,
         ])

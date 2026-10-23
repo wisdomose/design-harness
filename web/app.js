@@ -6,6 +6,9 @@
 // system; the body is the page, written only in that system's tokens.
 
 const STORAGE_KEY = "dh-project";
+const OPTIONS_KEY = "dh-options"; // the chosen model and effort
+const RECENT_KEY = "dh-recent-directions"; // art directions of recent designs
+const RECENT_LIMIT = 9;
 const FRAMES = {
   board: { width: 560, viewportHeight: 900 },
   desktop: { width: 1440, viewportHeight: 900 },
@@ -14,7 +17,7 @@ const FRAMES = {
 const SCREENSHOT_LIB = "https://cdn.jsdelivr.net/npm/html-to-image@1.11.13/+esm";
 
 const $ = (id) => document.getElementById(id);
-const state = { html: "", messages: [], busy: false, abort: null };
+const state = { html: "", messages: [], busy: false, abort: null, directionNames: {} };
 
 // ---------------------------------------------------------------- reading a file
 
@@ -32,6 +35,26 @@ function parseTheme(html) {
 function titleOf(html) {
   const m = html.match(/<title>([\s\S]*?)<\/title>/i);
   return m ? decodeEntities(m[1].trim()) : "";
+}
+
+function directionsOf(html) {
+  const m = html.match(/<meta\s+name="design-directions"\s+content="([^"]*)"/i);
+  return m ? m[1].split(",").map((d) => d.trim()).filter(Boolean) : [];
+}
+
+function rememberDirections(html) {
+  const used = directionsOf(html);
+  if (!used.length) return;
+  const recent = recentDirections().filter((d) => !used.includes(d));
+  localStorage.setItem(RECENT_KEY, JSON.stringify([...used, ...recent].slice(0, RECENT_LIMIT)));
+}
+
+function recentDirections() {
+  try {
+    return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
+  } catch {
+    return [];
+  }
 }
 
 function briefOf(html) {
@@ -200,6 +223,9 @@ function boardDocument(doc) {
   const head = doc.slice(0, headEnd + "</head>".length);
   const name = titleOf(doc) || "Your brand";
   const brief = briefOf(doc);
+  const direction = directionsOf(doc)
+    .map((id) => state.directionNames[id] || id)
+    .join(" × ");
   const colors = theme.filter((t) => t.name.startsWith("color-"));
   const fonts = theme.filter((t) => t.name.startsWith("font-"));
   const radii = theme.filter((t) => t.name.startsWith("radius-"));
@@ -238,6 +264,7 @@ function boardDocument(doc) {
     ${label("Brand")}
     <h1 class="font-heading text-5xl leading-tight">${escapeHtml(name)}</h1>
     ${brief ? `<p class="mt-3 text-muted leading-relaxed">${escapeHtml(brief)}</p>` : ""}
+    ${direction ? `<p class="mt-3 text-sm"><span class="text-muted">Direction:</span> ${escapeHtml(direction)}</p>` : ""}
   </div>
   <section>${label("Colour")}<div class="grid grid-cols-3 gap-4">${swatches}</div></section>
   <section>${label("Type")}<div class="flex flex-col gap-5">${type}
@@ -359,7 +386,14 @@ async function send(text) {
     const res = await fetch("/api/design", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: text, html: state.html || null, history }),
+      body: JSON.stringify({
+        message: text,
+        html: state.html || null,
+        history,
+        model: $("model").value || undefined,
+        effort: $("effort").value || undefined,
+        recentDirections: recentDirections(),
+      }),
       signal: abort.signal,
     });
     if (res.status === 401) {
@@ -418,6 +452,7 @@ async function send(text) {
     state.messages.push({ role: "agent", text: note });
   } else {
     state.html = doc;
+    rememberDirections(doc);
     showDesign(doc);
     const theme = parseTheme(doc) || [];
     const font = (n) => (theme.find((t) => t.name === `font-${n}`)?.value || "").split(",")[0].replace(/["']/g, "");
@@ -692,6 +727,37 @@ $("login-form").onsubmit = async (e) => {
   }
 };
 
+/** Fills the model and effort pickers from the server's list. */
+async function loadOptions() {
+  const res = await fetch("/api/options");
+  if (!res.ok) return;
+  const options = await res.json();
+  state.directionNames = Object.fromEntries(options.directions.map((d) => [d.id, d.name]));
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(OPTIONS_KEY) || "{}");
+  } catch {}
+  const fill = (select, items, chosen) => {
+    select.innerHTML = "";
+    for (const { value, label } of items) select.add(new Option(label, value, false, value === chosen));
+  };
+  const modelIds = options.models.map((m) => m.id);
+  fill(
+    $("model"),
+    options.models.map((m) => ({ value: m.id, label: m.label })),
+    modelIds.includes(saved.model) ? saved.model : options.defaultModel,
+  );
+  fill(
+    $("effort"),
+    options.efforts.map((e) => ({ value: e, label: e })),
+    options.efforts.includes(saved.effort) ? saved.effort : options.defaultEffort,
+  );
+  const persist = () =>
+    localStorage.setItem(OPTIONS_KEY, JSON.stringify({ model: $("model").value, effort: $("effort").value }));
+  $("model").onchange = persist;
+  $("effort").onchange = persist;
+}
+
 function start() {
   $("login").hidden = true;
   $("app").hidden = false;
@@ -703,6 +769,7 @@ function start() {
     }
   } catch {}
   renderMessages();
+  loadOptions().then(() => state.html && showDesign(state.html, { page: false }));
   if (state.html) {
     showDesign(state.html);
     setTimeout(fit, 300);

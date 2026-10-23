@@ -6,7 +6,13 @@
 //! machine has (`CLAUDE_CODE_OAUTH_TOKEN` in the container), so the demo is
 //! private: every route but the login page needs the demo password.
 
-use std::{collections::HashSet, convert::Infallible, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    process::Stdio,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 mod directions;
 mod reference;
@@ -44,6 +50,17 @@ const SYSTEM_PROMPT: &str = include_str!("prompt.md");
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
+
+/// The page, with the script and stylesheet addresses carrying a version
+/// taken from their contents. Cloudflare rewrites the caching rule for .js and
+/// .css files to "keep for four hours", so without a new address per release a
+/// browser keeps running the old script against the new page.
+static PAGE: LazyLock<String> = LazyLock::new(|| {
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&(APP_JS, APP_CSS), &mut hasher);
+    let version = format!("{:x}", std::hash::Hasher::finish(&hasher));
+    INDEX_HTML.replace("{{VERSION}}", &version)
+});
 
 struct AppState {
     password: String,
@@ -102,7 +119,7 @@ async fn main() {
     let app = Router::new()
         .route(
             "/",
-            get(|| async { static_file("text/html; charset=utf-8", INDEX_HTML) }),
+            get(|| async { static_file("text/html; charset=utf-8", &PAGE) }),
         )
         .route(
             "/app.js",

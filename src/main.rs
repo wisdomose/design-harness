@@ -458,7 +458,16 @@ async fn run_claude(
 
     let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
     let mut failure: Option<String> = None;
-    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => line.map_err(|e| e.to_string())?,
+            // The browser went away (a closed tab, Stop) — possibly while the
+            // designer is still thinking and nothing is being sent, so a
+            // failed send would never reveal it. Dropping the child stops
+            // claude and frees the server for the next design.
+            () = tx.closed() => return Ok(()),
+        };
+        let Some(line) = line else { break };
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
